@@ -34,6 +34,21 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
     );
 
     if (event.type === "checkout.session.completed") {
+        // Reset tokens every successful invoice payment (new billing cycle)
+if (event.type === "invoice.paid") {
+  const invoice = event.data.object;
+
+  const subscriptionId = invoice.subscription;
+
+  await pool.query(
+    `UPDATE tenants
+     SET tokens_used = 0
+     WHERE stripe_subscription_id = $1`,
+    [subscriptionId]
+  );
+
+  console.log("Tokens reset for subscription:", subscriptionId);
+}
       const session = event.data.object;
 
       const email = session.customer_email;
