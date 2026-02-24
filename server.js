@@ -57,6 +57,26 @@ app.get("/health", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+app.post("/create-test-tenant", async (req, res) => {
+  try {
+    const { email } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: "Email required" });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO tenants (email, subscription_status)
+       VALUES ($1, 'active')
+       RETURNING *`,
+      [email]
+    );
+
+    res.json({ success: true, tenant: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const port = process.env.PORT || 8080;
 
