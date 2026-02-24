@@ -1,3 +1,4 @@
+import cors from "cors";
 import "dotenv/config";
 import express from "express";
 import pkg from "pg";
@@ -7,6 +8,13 @@ import Stripe from "stripe";
 const { Pool } = pkg;
 
 const app = express();
+app.use(cors({
+  origin: [
+    "https://c314821b-4788-4591-a583-777c13f3b498.lovableproject.com"
+  ],
+  methods: ["GET", "POST"],
+  allowedHeaders: ["Content-Type", "x-tenant-id", "x-shared-secret"]
+}));
 
 if (!process.env.DATABASE_URL) process.exit(1);
 if (!process.env.OPENAI_API_KEY) process.exit(1);
