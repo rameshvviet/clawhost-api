@@ -10,7 +10,7 @@ const { Pool } = pkg;
 const app = express();
 app.use(cors({
   origin: [
-    "https://c314821b-4788-4591-a583-777c13f3b498.lovableproject.com"
+    "https://claw-host-ai-subscription.lovable.app"
   ],
   methods: ["GET", "POST"],
   allowedHeaders: ["Content-Type", "x-tenant-id", "x-shared-secret"]
