@@ -55,7 +55,7 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
       process.env.STRIPE_WEBHOOK_SECRET
     );
 
-    /* ---- SUBSCRIPTION ACTIVATION ---- */
+    // Subscription activated
     if (event.type === "checkout.session.completed") {
       const session = event.data.object;
 
@@ -86,7 +86,7 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
       }
     }
 
-    /* ---- MONTHLY TOKEN RESET ---- */
+    // Monthly token reset
     if (event.type === "invoice.paid") {
       const invoice = event.data.object;
       const subscriptionId = invoice.subscription;
@@ -158,10 +158,41 @@ app.get("/health", async (req, res) => {
 });
 
 /* ==============================
+   TENANT STATUS (NEW)
+============================== */
+app.get("/tenant-status", async (req, res) => {
+  const { email } = req.query;
+
+  if (!email) {
+    return res.status(400).json({ error: "Email required" });
+  }
+
+  const result = await pool.query(
+    "SELECT id, subscription_status, tokens_used, monthly_token_limit FROM tenants WHERE email=$1",
+    [email]
+  );
+
+  if (result.rows.length === 0) {
+    return res.json({ exists: false });
+  }
+
+  const tenant = result.rows[0];
+
+  res.json({
+    exists: true,
+    tenant_id: tenant.id,
+    subscription_status: tenant.subscription_status,
+    tokens_used: tenant.tokens_used,
+    monthly_token_limit: tenant.monthly_token_limit
+  });
+});
+
+/* ==============================
    STRIPE CHECKOUT SESSION
 ============================== */
 app.post("/create-checkout-session", async (req, res) => {
   const { email } = req.body;
+
   if (!email) return res.status(400).json({ error: "Email required" });
 
   const session = await stripe.checkout.sessions.create({
@@ -198,6 +229,7 @@ app.post("/llm/chat", async (req, res) => {
   }
 
   const t = await pool.query(`SELECT * FROM tenants WHERE id=$1`, [tenantId]);
+
   if (t.rows.length === 0) {
     return res.status(404).json({ error: "Tenant not found" });
   }
