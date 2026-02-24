@@ -8,14 +8,23 @@ import Stripe from "stripe";
 const { Pool } = pkg;
 
 const app = express();
+
+/* ==============================
+   CORS (MUST BE FIRST)
+============================== */
 app.use(cors({
   origin: [
     "https://claw-host-ai-subscription.lovable.app"
   ],
-  methods: ["GET", "POST"],
+  methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "x-tenant-id", "x-shared-secret"]
 }));
 
+app.options("*", cors());
+
+/* ==============================
+   ENV VALIDATION
+============================== */
 if (!process.env.DATABASE_URL) process.exit(1);
 if (!process.env.OPENAI_API_KEY) process.exit(1);
 if (!process.env.GATEWAY_SHARED_SECRET) process.exit(1);
@@ -24,6 +33,9 @@ if (!process.env.STRIPE_PRICE_ID) process.exit(1);
 if (!process.env.STRIPE_WEBHOOK_SECRET) process.exit(1);
 if (!process.env.APP_BASE_URL) process.exit(1);
 
+/* ==============================
+   SERVICES
+============================== */
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
@@ -32,7 +44,9 @@ const pool = new Pool({
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 
-// 1) Stripe webhook MUST be raw body and MUST be declared before json parser
+/* ==============================
+   STRIPE WEBHOOK (RAW BODY)
+============================== */
 app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
     const event = stripe.webhooks.constructEvent(
@@ -41,30 +55,18 @@ app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (re
       process.env.STRIPE_WEBHOOK_SECRET
     );
 
+    /* ---- SUBSCRIPTION ACTIVATION ---- */
     if (event.type === "checkout.session.completed") {
-        // Reset tokens every successful invoice payment (new billing cycle)
-if (event.type === "invoice.paid") {
-  const invoice = event.data.object;
-
-  const subscriptionId = invoice.subscription;
-
-  await pool.query(
-    `UPDATE tenants
-     SET tokens_used = 0
-     WHERE stripe_subscription_id = $1`,
-    [subscriptionId]
-  );
-
-  console.log("Tokens reset for subscription:", subscriptionId);
-}
       const session = event.data.object;
 
       const email = session.customer_email;
       const customerId = session.customer;
       const subscriptionId = session.subscription;
 
-      // Upsert tenant
-      const existing = await pool.query("SELECT id FROM tenants WHERE email=$1", [email]);
+      const existing = await pool.query(
+        "SELECT id FROM tenants WHERE email=$1",
+        [email]
+      );
 
       if (existing.rows.length === 0) {
         await pool.query(
@@ -84,20 +86,40 @@ if (event.type === "invoice.paid") {
       }
     }
 
+    /* ---- MONTHLY TOKEN RESET ---- */
+    if (event.type === "invoice.paid") {
+      const invoice = event.data.object;
+      const subscriptionId = invoice.subscription;
+
+      await pool.query(
+        `UPDATE tenants
+         SET tokens_used = 0
+         WHERE stripe_subscription_id = $1`,
+        [subscriptionId]
+      );
+
+      console.log("Tokens reset for subscription:", subscriptionId);
+    }
+
     res.json({ received: true });
+
   } catch (err) {
     console.error("Webhook error:", err.message);
     res.status(400).send(`Webhook Error: ${err.message}`);
   }
 });
 
-// 2) JSON parser for everything else
+/* ==============================
+   JSON PARSER (AFTER WEBHOOK)
+============================== */
 app.use(express.json({ limit: "1mb" }));
 
+/* ==============================
+   DATABASE INIT + MIGRATION
+============================== */
 async function initDB() {
   await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 
-  // Create base table (older versions might already exist)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tenants (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -109,7 +131,6 @@ async function initDB() {
     );
   `);
 
-  // ✅ Add Stripe columns if missing (one-time migration)
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;`);
   await pool.query(`ALTER TABLE tenants ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;`);
 
@@ -128,11 +149,17 @@ async function initDB() {
   console.log("Tables ensured + migrations ensured");
 }
 
+/* ==============================
+   HEALTH
+============================== */
 app.get("/health", async (req, res) => {
   const r = await pool.query("SELECT 1 as ok");
   res.json({ ok: true, db: r.rows[0].ok });
 });
 
+/* ==============================
+   STRIPE CHECKOUT SESSION
+============================== */
 app.post("/create-checkout-session", async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ error: "Email required" });
@@ -149,6 +176,9 @@ app.post("/create-checkout-session", async (req, res) => {
   res.json({ url: session.url });
 });
 
+/* ==============================
+   LLM GATEWAY
+============================== */
 app.post("/llm/chat", async (req, res) => {
   const tenantId = req.header("x-tenant-id");
   const sharedSecret = req.header("x-shared-secret");
@@ -156,15 +186,21 @@ app.post("/llm/chat", async (req, res) => {
   if (sharedSecret !== process.env.GATEWAY_SHARED_SECRET) {
     return res.status(401).json({ error: "Unauthorized" });
   }
-  if (!tenantId) return res.status(400).json({ error: "Missing x-tenant-id" });
+
+  if (!tenantId) {
+    return res.status(400).json({ error: "Missing x-tenant-id" });
+  }
 
   const { messages, max_tokens } = req.body;
+
   if (!Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: "messages must be a non-empty array" });
   }
 
   const t = await pool.query(`SELECT * FROM tenants WHERE id=$1`, [tenantId]);
-  if (t.rows.length === 0) return res.status(404).json({ error: "Tenant not found" });
+  if (t.rows.length === 0) {
+    return res.status(404).json({ error: "Tenant not found" });
+  }
 
   const tenant = t.rows[0];
 
@@ -182,6 +218,7 @@ app.post("/llm/chat", async (req, res) => {
   const totalTokens = usage.total_tokens;
 
   const newUsed = Number(tenant.tokens_used) + Number(totalTokens);
+
   if (newUsed > Number(tenant.monthly_token_limit)) {
     return res.status(402).json({ error: "Token limit reached" });
   }
@@ -192,7 +229,10 @@ app.post("/llm/chat", async (req, res) => {
     [tenantId, "gpt-4o-mini", usage.prompt_tokens, usage.completion_tokens, totalTokens]
   );
 
-  await pool.query(`UPDATE tenants SET tokens_used=$1 WHERE id=$2`, [newUsed, tenantId]);
+  await pool.query(
+    `UPDATE tenants SET tokens_used=$1 WHERE id=$2`,
+    [newUsed, tenantId]
+  );
 
   res.json({
     message: completion.choices[0].message,
@@ -201,6 +241,9 @@ app.post("/llm/chat", async (req, res) => {
   });
 });
 
+/* ==============================
+   START SERVER
+============================== */
 const port = process.env.PORT || 8080;
 
 app.listen(port, async () => {
