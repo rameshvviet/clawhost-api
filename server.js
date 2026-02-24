@@ -7,6 +7,7 @@ const { Pool } = pkg;
 const app = express();
 app.use(express.json());
 
+// Stop immediately if DB not connected
 if (!process.env.DATABASE_URL) {
   console.error("Missing DATABASE_URL");
   process.exit(1);
@@ -17,11 +18,10 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Create tables automatically on startup
 async function initDB() {
-  // Enable UUID extension
   await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`);
 
-  // Tenants table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS tenants (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -33,7 +33,6 @@ async function initDB() {
     );
   `);
 
-  // Usage events table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS usage_events (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -49,6 +48,7 @@ async function initDB() {
   console.log("Tables ensured");
 }
 
+// Health check
 app.get("/health", async (req, res) => {
   try {
     const r = await pool.query("SELECT 1 as ok");
@@ -57,12 +57,14 @@ app.get("/health", async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
-app.post("/create-test-tenant", async (req, res) => {
+
+// TEMP test route (browser friendly)
+app.get("/create-test-tenant", async (req, res) => {
   try {
-    const { email } = req.body;
+    const email = req.query.email;
 
     if (!email) {
-      return res.status(400).json({ error: "Email required" });
+      return res.status(400).json({ error: "Add ?email=you@example.com" });
     }
 
     const result = await pool.query(
