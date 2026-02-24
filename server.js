@@ -7,6 +7,56 @@ import Stripe from "stripe";
 const { Pool } = pkg;
 
 const app = express();
+
+// IMPORTANT: Stripe webhook must use raw body
+app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+    const event = stripe.webhooks.constructEvent(
+      req.body,
+      req.headers["stripe-signature"],
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+
+    if (event.type === "checkout.session.completed") {
+      const session = event.data.object;
+
+      const email = session.customer_email;
+      const customerId = session.customer;
+      const subscriptionId = session.subscription;
+
+      const existing = await pool.query(
+        "SELECT id FROM tenants WHERE email=$1",
+        [email]
+      );
+
+      if (existing.rows.length === 0) {
+        await pool.query(
+          `INSERT INTO tenants (email, subscription_status, stripe_customer_id, stripe_subscription_id)
+           VALUES ($1, 'active', $2, $3)`,
+          [email, customerId, subscriptionId]
+        );
+      } else {
+        await pool.query(
+          `UPDATE tenants
+           SET subscription_status='active',
+               stripe_customer_id=$1,
+               stripe_subscription_id=$2
+           WHERE email=$3`,
+          [customerId, subscriptionId, email]
+        );
+      }
+    }
+
+    res.json({ received: true });
+  } catch (err) {
+    console.error("Webhook error:", err.message);
+    res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+});
+
+// AFTER webhook route, enable JSON parser
 app.use(express.json({ limit: "1mb" }));
 
 if (!process.env.DATABASE_URL) process.exit(1);
@@ -59,15 +109,8 @@ app.get("/health", async (req, res) => {
   res.json({ ok: true, db: r.rows[0].ok });
 });
 
-/**
- * Create Stripe Checkout Session
- */
 app.post("/create-checkout-session", async (req, res) => {
   const { email } = req.body;
-
-  if (!email) {
-    return res.status(400).json({ error: "Email required" });
-  }
 
   const session = await stripe.checkout.sessions.create({
     mode: "subscription",
@@ -86,49 +129,6 @@ app.post("/create-checkout-session", async (req, res) => {
   res.json({ url: session.url });
 });
 
-/**
- * Stripe Webhook
- */
-app.post("/stripe-webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  const event = stripe.webhooks.constructEvent(
-    req.body,
-    req.headers["stripe-signature"],
-    process.env.STRIPE_WEBHOOK_SECRET
-  );
-
-  if (event.type === "checkout.session.completed") {
-    const session = event.data.object;
-
-    const email = session.customer_email;
-    const customerId = session.customer;
-    const subscriptionId = session.subscription;
-
-    const existing = await pool.query("SELECT id FROM tenants WHERE email=$1", [email]);
-
-    if (existing.rows.length === 0) {
-      await pool.query(
-        `INSERT INTO tenants (email, subscription_status, stripe_customer_id, stripe_subscription_id)
-         VALUES ($1, 'active', $2, $3)`,
-        [email, customerId, subscriptionId]
-      );
-    } else {
-      await pool.query(
-        `UPDATE tenants
-         SET subscription_status='active',
-             stripe_customer_id=$1,
-             stripe_subscription_id=$2
-         WHERE email=$3`,
-        [customerId, subscriptionId, email]
-      );
-    }
-  }
-
-  res.json({ received: true });
-});
-
-/**
- * LLM Gateway
- */
 app.post("/llm/chat", async (req, res) => {
   const tenantId = req.header("x-tenant-id");
   const sharedSecret = req.header("x-shared-secret");
@@ -138,14 +138,8 @@ app.post("/llm/chat", async (req, res) => {
   }
 
   const { messages, max_tokens } = req.body;
-  const MAX_OUTPUT = 500;
-  const maxOut = Math.min(Number(max_tokens || MAX_OUTPUT), MAX_OUTPUT);
 
-  const t = await pool.query(
-    `SELECT * FROM tenants WHERE id=$1`,
-    [tenantId]
-  );
-
+  const t = await pool.query(`SELECT * FROM tenants WHERE id=$1`, [tenantId]);
   if (t.rows.length === 0) return res.status(404).json({ error: "Tenant not found" });
 
   const tenant = t.rows[0];
@@ -157,15 +151,13 @@ app.post("/llm/chat", async (req, res) => {
   const completion = await openai.chat.completions.create({
     model: "gpt-4o-mini",
     messages,
-    max_tokens: maxOut
+    max_tokens: Math.min(max_tokens || 500, 500)
   });
 
   const usage = completion.usage;
   const totalTokens = usage.total_tokens;
 
-  const newUsed = tenant.tokens_used + totalTokens;
-
-  if (newUsed > tenant.monthly_token_limit) {
+  if (tenant.tokens_used + totalTokens > tenant.monthly_token_limit) {
     return res.status(402).json({ error: "Token limit reached" });
   }
 
@@ -176,14 +168,13 @@ app.post("/llm/chat", async (req, res) => {
   );
 
   await pool.query(
-    `UPDATE tenants SET tokens_used=$1 WHERE id=$2`,
-    [newUsed, tenantId]
+    `UPDATE tenants SET tokens_used=tokens_used+$1 WHERE id=$2`,
+    [totalTokens, tenantId]
   );
 
   res.json({
     message: completion.choices[0].message,
-    tokens_used: newUsed,
-    monthly_token_limit: tenant.monthly_token_limit
+    tokens_used: tenant.tokens_used + totalTokens
   });
 });
 
